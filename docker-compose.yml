@@ -1,0 +1,18 @@
+services:
+  deviantart_downloader:
+    container_name: deviantart_downloader
+    restart: "unless-stopped"
+    build: .
+    environment:
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - USERNAME=${USERNAME}
+      - SAVE_DIR=/downloads
+      - DB_PATH=/downloads/deviantart.db
+      - LOG_PATH=/downloads/downloader.log
+      - SLEEP_TIME=2.5
+      - MAX_RETRIES=10
+      - RATE_LIMIT_SLEEP=120
+      - FORCE_RECHECK=false   # Set to true to force re-check from start
+    volumes:
+      - ./downloads:/downloads
