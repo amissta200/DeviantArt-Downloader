@@ -174,13 +174,26 @@ def get_followed_artists(token):
 def save_deviation(token, artist, deviation):
     deviation_id = deviation["deviationid"]
     title = deviation.get("title", "untitled")
-    content = deviation.get("content", {}).get("src")
+    content = deviation.get("content", {})
     url = deviation.get("url")
 
+    # Skip already downloaded
     if is_downloaded(deviation_id):
         logging.debug(f"⏩ Skipping already downloaded {deviation_id}")
         return
 
+    # Skip subscription or locked content
+    if (
+        not content
+        or not content.get("src")
+        or deviation.get("is_downloadable") is False
+        or deviation.get("premium_content")
+        or deviation.get("premium_folder_data")
+    ):
+        logging.info(f"💰 Skipping subscription-only or locked deviation: {title} ({deviation_id})")
+        return
+
+    # Fetch metadata for tags
     meta_url = "https://www.deviantart.com/api/v1/oauth2/deviation/metadata"
     params = {
         "access_token": token,
@@ -210,17 +223,18 @@ def save_deviation(token, artist, deviation):
         f.write(f"url: {url}\n\n")
         f.write("\n".join(tags) + "\n")
 
-    if content:
-        try:
-            img = requests.get(content)
-            img.raise_for_status()
-            with open(img_path, "wb") as f:
-                f.write(img.content)
-        except Exception as e:
-            logging.warning(f"⚠️ Failed to download image {title}: {e}")
+    # Save image
+    try:
+        img = requests.get(content["src"])
+        img.raise_for_status()
+        with open(img_path, "wb") as f:
+            f.write(img.content)
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to download image {title}: {e}")
 
     mark_downloaded(deviation_id, artist, title, url, tags)
     logging.info(f"✅ Saved {deviation_id} ({title}) for {artist} ({len(tags)} tags)")
+
 
 # --------------------------
 # Main

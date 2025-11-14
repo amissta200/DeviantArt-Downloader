@@ -3,10 +3,11 @@ services:
     container_name: deviantart_downloader
     restart: "unless-stopped"
     build: .
+    env_file: .env
     environment:
-      - CLIENT_ID=${CLIENT_ID}
-      - CLIENT_SECRET=${CLIENT_SECRET}
-      - USERNAME=${USERNAME}
+      - CLIENT_ID=${ID}
+      - CLIENT_SECRET=${SECRET}
+      - USERNAME=${USER}
       - SAVE_DIR=/downloads
       - DB_PATH=/downloads/deviantart.db
       - LOG_PATH=/downloads/downloader.log
