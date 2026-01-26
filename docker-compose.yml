@@ -1,7 +1,6 @@
 services:
   deviantart_downloader:
     container_name: deviantart_downloader
-    restart: "unless-stopped"
     build: .
     env_file: .env
     environment:
@@ -17,3 +16,8 @@ services:
       - FORCE_RECHECK=false   # Set to true to force re-check from start
     volumes:
       - ./downloads:/downloads
+  autotagger-deviantart:
+      container_name: autotagger-deviantart
+      image: ghcr.io/danbooru/autotagger
+      depends_on:
+        - deviantart_downloader

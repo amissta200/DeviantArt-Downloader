@@ -232,6 +232,32 @@ def save_deviation(token, artist, deviation):
     except Exception as e:
         logging.warning(f"⚠️ Failed to download image {title}: {e}")
 
+    try:
+        with open(img_path, "rb") as img_file:
+            response = requests.post(
+                "http://autotagger-deviantart:5000/evaluate",
+                files={"file": img_file},
+                data={"format": "json"},
+                timeout=60
+            )
+
+        response.raise_for_status()
+        tagger_output = response.json()
+
+        # Extract tag names (ignore confidence values)
+        ai_tags = []
+        if isinstance(tagger_output, list) and tagger_output:
+            ai_tags = list(tagger_output[0].get("tags", {}).keys())
+
+        # Append tags to existing txt
+        if ai_tags:
+            with open(txt_path, "a", encoding="utf-8") as f:
+                f.write("\n# AI tags\n")
+                f.write("\n".join(ai_tags) + "\n")
+
+    except Exception as e:
+        logging.warning(f"⚠️ Tagger failed for {img_path}: {e}")
+
     mark_downloaded(deviation_id, artist, title, url, tags)
     logging.info(f"✅ Saved {deviation_id} ({title}) for {artist} ({len(tags)} tags)")
 
