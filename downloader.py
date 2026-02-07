@@ -20,6 +20,8 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 RATE_LIMIT_SLEEP = int(os.getenv("RATE_LIMIT_SLEEP", 30))
 FORCE_RECHECK = os.getenv("FORCE_RECHECK", "false").lower() == "true"
 PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
+DOWNLOAD_SUBSCRIPTIONS = os.getenv("DOWNLOAD_SUBSCRIPTIONS", "false").lower() == "true"
+
 
 if not all([CLIENT_ID, CLIENT_SECRET, USERNAME]):
     raise ValueError("Missing CLIENT_ID, CLIENT_SECRET, or USERNAME in environment variables.")
@@ -41,8 +43,23 @@ logging.basicConfig(
 # --------------------------
 # Database setup
 # --------------------------
+def add_is_premium_column_if_missing(conn):
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE downloads ADD COLUMN is_premium INTEGER DEFAULT 0")
+        conn.commit()
+        logging.info("✅ Added 'is_premium' column to downloads table.")
+    except sqlite3.OperationalError as e:
+        # This error usually means the column already exists, so safe to ignore
+        if "duplicate column name" in str(e):
+            logging.info("'is_premium' column already exists, skipping ALTER TABLE.")
+        else:
+            logging.error(f"❌ Unexpected error altering table: {e}")
+            raise
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    add_is_premium_column_if_missing(conn)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS downloads (
@@ -51,6 +68,7 @@ def init_db():
             title TEXT,
             url TEXT,
             tags TEXT,
+            is_premium INTEGER DEFAULT 0,
             downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -63,6 +81,24 @@ def is_downloaded(deviation_id):
     c = conn.cursor()
     c.execute("SELECT 1 FROM downloads WHERE deviationid = ?", (deviation_id,))
     return c.fetchone() is not None
+
+def mark_subscription(deviation_id, artist, title, url):
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR IGNORE INTO downloads 
+        (deviationid, artist, title, url, tags, is_premium)
+        VALUES (?, ?, ?, ?, ?, 1)
+    """, (deviation_id, artist, title, url, ""))
+    conn.commit()
+
+def is_subscription(deviation_id):
+    c = conn.cursor()
+    c.execute(
+        "SELECT is_premium FROM downloads WHERE deviationid = ?",
+        (deviation_id,)
+    )
+    row = c.fetchone()
+    return row and row[0] == 1
 
 def mark_downloaded(deviation_id, artist, title, url, tags):
     c = conn.cursor()
@@ -178,21 +214,36 @@ def save_deviation(token, artist, deviation):
     content = deviation.get("content", {})
     url = deviation.get("url")
 
-    # Skip already downloaded
+    # Known subscription → always skip first
+    if is_subscription(deviation_id):
+        logging.debug(f"⏩ Known subscription content skipped: {title} ({deviation_id})")
+        return
+
+    # Skip already downloaded normal content
     if is_downloaded(deviation_id):
         logging.debug(f"⏩ Skipping already downloaded {deviation_id}")
         return
 
-    # Skip subscription or locked content
-    if (
-        not content
-        or not content.get("src")
-        or deviation.get("is_downloadable") is False
-        or deviation.get("premium_content")
+    is_premium = (
+        deviation.get("premium_content")
         or deviation.get("premium_folder_data")
-    ):
-        logging.info(f"💰 Skipping subscription-only or locked deviation: {title} ({deviation_id})")
-        return
+        or deviation.get("is_downloadable") is False
+        or not content
+        or not content.get("src")
+    )
+
+    if is_premium:
+        logging.info(f"💰 Detected subscription content: {title} ({deviation_id})")
+
+        # Always flag in DB
+        mark_subscription(deviation_id, artist, title, url)
+
+        # Only download if explicitly enabled
+        if not DOWNLOAD_SUBSCRIPTIONS:
+            return
+
+        logging.warning(f"⚠️ DOWNLOAD_SUBSCRIPTIONS enabled — attempting download anyway")
+
 
     # Fetch metadata for tags
     meta_url = "https://www.deviantart.com/api/v1/oauth2/deviation/metadata"
