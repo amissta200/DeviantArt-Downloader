@@ -225,9 +225,23 @@ def save_deviation(token, artist, deviation):
     if is_downloaded(deviation_id):
         logging.debug(f"⏩ Skipping already downloaded {deviation_id}")
         return
-    def is_subscription_content(deviation):
+        
+    def is_subscription_content(deviation: dict) -> bool:
+        # ---- Legacy DA premium system ----
         premium_data = deviation.get("premium_folder_data")
-        return premium_data is not None and premium_data.get("type") == "paid"
+        if premium_data is not None and premium_data.get("type") == "paid":
+            return True
+
+        # ---- Modern DA access control ----
+        # Field only exists when gating is active
+        if "tier_access" in deviation:
+            return True
+
+        # ---- Tier system presence ----
+        if "primary_tier" in deviation:
+            return True
+
+        return False
 
     is_premium = is_subscription_content(deviation)
 
