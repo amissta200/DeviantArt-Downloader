@@ -107,9 +107,9 @@ def deviantart_get(url, token, params=None):
 
             if r.status_code == 401:
                 logging.warning("🔄 Token expired — refreshing...")
-                token = get_access_token()
+                token = get_access_token()   # refresh
                 retries += 1
-                continue
+                continue                     # retry with new token
 
             if not r.ok:
                 logging.error(f"❌ Request failed {r.status_code}: {r.text[:200]}")
@@ -125,6 +125,7 @@ def deviantart_get(url, token, params=None):
             time.sleep(SLEEP_TIME)
 
     raise RuntimeError(f"Failed after {MAX_RETRIES} retries: {url}")
+
 
 # --------------------------
 # Load/save progress checkpoint
