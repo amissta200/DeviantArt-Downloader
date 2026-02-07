@@ -15,6 +15,7 @@ services:
       - RATE_LIMIT_SLEEP=120
       - FORCE_RECHECK=false   # Set to true to force re-check from start
       - DOWNLOAD_SUBSCRIPTIONS=false
+      - DEBUG_MODE=false
     volumes:
       - ./downloads:/downloads
   autotagger-deviantart:

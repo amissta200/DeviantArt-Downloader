@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import json
 import requests
+import pprint
 from requests.exceptions import HTTPError, RequestException
 
 # --------------------------
@@ -21,6 +22,7 @@ RATE_LIMIT_SLEEP = int(os.getenv("RATE_LIMIT_SLEEP", 30))
 FORCE_RECHECK = os.getenv("FORCE_RECHECK", "false").lower() == "true"
 PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
 DOWNLOAD_SUBSCRIPTIONS = os.getenv("DOWNLOAD_SUBSCRIPTIONS", "false").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 
 if not all([CLIENT_ID, CLIENT_SECRET, USERNAME]):
@@ -32,7 +34,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # Logging setup
 # --------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(LOG_PATH, encoding="utf-8"),
@@ -59,7 +61,6 @@ def add_is_premium_column_if_missing(conn):
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    add_is_premium_column_if_missing(conn)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS downloads (
@@ -72,6 +73,7 @@ def init_db():
             downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    add_is_premium_column_if_missing(conn)
     conn.commit()
     return conn
 
@@ -223,17 +225,16 @@ def save_deviation(token, artist, deviation):
     if is_downloaded(deviation_id):
         logging.debug(f"⏩ Skipping already downloaded {deviation_id}")
         return
+    def is_subscription_content(deviation):
+        premium_data = deviation.get("premium_folder_data")
+        return premium_data is not None and premium_data.get("type") == "paid"
 
-    is_premium = (
-        deviation.get("premium_content")
-        or deviation.get("premium_folder_data")
-        or deviation.get("is_downloadable") is False
-        or not content
-        or not content.get("src")
-    )
+    is_premium = is_subscription_content(deviation)
 
     if is_premium:
         logging.info(f"💰 Detected subscription content: {title} ({deviation_id})")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(pprint.pformat(deviation))
 
         # Always flag in DB
         mark_subscription(deviation_id, artist, title, url)
