@@ -15,9 +15,12 @@ services:
       - SLEEP_TIME=2.5
       - MAX_RETRIES=10
       - RATE_LIMIT_SLEEP=120
-      - FORCE_RECHECK=false   # Set to true to force re-check from start
+      - FORCE_RECHECK=false
       - DOWNLOAD_SUBSCRIPTIONS=false
       - DEBUG_MODE=false
+      - REDIRECT_URI=http://localhost:8080/callback
+      - AUTOTAGGER_URL=http://autotagger-deviantart:5000/evaluate
+      - ENABLE_AUTOTAGGER=true
     volumes:
       - ./downloads:/downloads
   autotagger-deviantart:
