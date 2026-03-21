@@ -23,6 +23,7 @@ services:
       - ENABLE_AUTOTAGGER=true
     volumes:
       - ./downloads:/downloads
+      - ./temporary:/temporary
   autotagger-deviantart:
       container_name: autotagger-deviantart
       image: ghcr.io/danbooru/autotagger

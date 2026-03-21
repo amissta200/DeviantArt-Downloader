@@ -6,6 +6,7 @@ import sqlite3
 import requests
 import urllib.parse
 import threading
+import shutil
 from queue import Queue
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 USERNAME = os.getenv("USERNAME")
 
 SAVE_DIR = os.getenv("SAVE_DIR", "./downloads")
+TEMP_DIR = os.getenv("TEMP_DIR", "./temporary")
 DB_PATH = os.getenv("DB_PATH", "./downloads/deviantart.db")
 
 SLEEP_TIME = float(os.getenv("SLEEP_TIME", 0.5))
@@ -33,6 +35,7 @@ PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
 
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/callback")
 
+os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --------------------------
@@ -111,6 +114,13 @@ def is_downloaded(dev_id):
     conn.close()
     return result is not None
 
+def safe_move(src, dst):
+    try:
+        os.replace(src, dst)  # fast path (same filesystem)
+    except OSError:
+        shutil.copy2(src, dst)  # cross-device fallback
+        os.remove(src)
+
 # --------------------------
 # TAG WORKER
 # --------------------------
@@ -135,13 +145,11 @@ def tag_worker():
 
                 res.raise_for_status()
 
-                # 🔍 Debug (optional, remove later)
                 if not res.text.strip():
                     raise Exception("Empty response from autotagger")
 
                 data = res.json()
 
-                # ✅ Match your old working format
                 if isinstance(data, list) and data:
                     tags_dict = data[0].get("tags", {})
                     tags = list(tags_dict.keys())
@@ -151,7 +159,46 @@ def tag_worker():
             except Exception as e:
                 log_event("error", "TAG_FAIL", id=dev_id, error=str(e))
 
+        # ✅ WRITE TXT FILE
+        try:
+            txt_path = os.path.splitext(img_path)[0] + ".txt"
+
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(f"title:{title}\n")
+                f.write(f"url:{url}\n\n")
+
+                if tags:
+                    f.write("# AI tags\n")
+                    f.write("\n".join(tags) + "\n")
+
+            log_event("info", "TXT_WRITTEN", id=dev_id)
+
+        except Exception as e:
+            log_event("error", "TXT_FAIL", id=dev_id, error=str(e))
+            tag_queue.task_done()
+            continue
+
+        # ✅ MOVE TO FINAL DESTINATION (atomic stage completion)
+        try:
+            final_artist_dir = os.path.join(SAVE_DIR, artist)
+            os.makedirs(final_artist_dir, exist_ok=True)
+
+            final_img = os.path.join(final_artist_dir, os.path.basename(img_path))
+            final_txt = os.path.splitext(final_img)[0] + ".txt"
+
+            safe_move(img_path, final_img)
+            safe_move(txt_path, final_txt)
+
+            log_event("info", "MOVED_TO_FINAL", id=dev_id)
+
+        except Exception as e:
+            log_event("error", "MOVE_FAIL", id=dev_id, error=str(e))
+            tag_queue.task_done()
+            continue
+
+        # ✅ send to DB AFTER successful move
         db_queue.put((dev_id, artist, title, url, tags))
+
         tag_queue.task_done()
 
 # --------------------------
@@ -305,10 +352,10 @@ def save_deviation(token, artist, dev):
         log_event("warning", "SKIP_BLUR", id=dev_id)
         return
 
-    artist_dir = os.path.join(SAVE_DIR, artist)
-    os.makedirs(artist_dir, exist_ok=True)
+    temp_artist_dir = os.path.join(TEMP_DIR, artist)
+    os.makedirs(temp_artist_dir, exist_ok=True)
 
-    img_path = os.path.join(artist_dir, f"{dev_id}.jpg")
+    img_path = os.path.join(temp_artist_dir, f"{dev_id}.jpg")
 
     try:
         res = requests.get(img_url, timeout=30)
