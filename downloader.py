@@ -1,12 +1,13 @@
 import os
 import time
 import json
-import logging
 import sqlite3
 import requests
 import urllib.parse
 import threading
 import shutil
+import sys
+from datetime import datetime
 from queue import Queue
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,9 +28,6 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", 6))
 RATE_LIMIT_SLEEP = int(os.getenv("RATE_LIMIT_SLEEP", 30))
 FORCE_RECHECK = os.getenv("FORCE_RECHECK", "false").lower() == "true"
 
-AUTOTAGGER_URL = os.getenv("AUTOTAGGER_URL", "")
-ENABLE_AUTOTAGGER = os.getenv("ENABLE_AUTOTAGGER", "false").lower() == "true"
-
 TOKEN_FILE = os.path.join(SAVE_DIR, "token.json")
 PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
 
@@ -39,16 +37,48 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --------------------------
-# LOGGING
+# LOGGING (COLOR + THREAD)
 # --------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
 
-def log_event(level, event, **kwargs):
-    msg = f"{event} | " + " | ".join(f"{k}={v}" for k, v in kwargs.items())
-    getattr(logging, level)(msg)
+COLORS = {
+    "DEBUG": "\033[90m",
+    "INFO": "\033[94m",
+    "WARNING": "\033[93m",
+    "ERROR": "\033[91m",
+    "CRITICAL": "\033[95m",
+    "END": "\033[0m",
+}
+
+def log(level, msg, **kwargs):
+    if level == "DEBUG" and LOG_LEVEL != "DEBUG":
+        return
+
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    thread = threading.current_thread().name
+    context = " ".join(f"{k}={v}" for k, v in kwargs.items())
+
+    color = COLORS.get(level, "")
+    end = COLORS["END"]
+
+    print(f"{color}[{ts}] [{level}] [{thread}] {msg} {context}{end}", file=sys.stderr)
+
+def dump_json(label, data, max_len=2000):
+    try:
+        txt = json.dumps(data, indent=2)[:max_len]
+        log("DEBUG", label, dump=txt)
+    except Exception as e:
+        log("ERROR", "JSON_DUMP_FAIL", error=str(e))
+
+# --------------------------
+# SAFETY WRAPPER
+# --------------------------
+def safe_run(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        log("CRITICAL", "THREAD_CRASH", fn=fn.__name__, error=str(e))
+        raise
 
 # --------------------------
 # QUEUES
@@ -57,7 +87,7 @@ db_queue = Queue()
 tag_queue = Queue()
 
 # --------------------------
-# DB INIT
+# DB
 # --------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -81,30 +111,31 @@ def init_db():
 
 init_db()
 
-# --------------------------
-# DB WORKER (SAFE)
-# --------------------------
 def db_worker():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
 
-    while True:
-        item = db_queue.get()
-        if item is None:
-            break
+        while True:
+            item = db_queue.get()
+            if item is None:
+                break
 
-        dev_id, artist, title, url, tags = item
+            dev_id, artist, title, url, tags = item
 
-        try:
-            c.execute("""
-                INSERT OR IGNORE INTO downloads (deviationid, artist, title, url, tags)
-                VALUES (?, ?, ?, ?, ?)
-            """, (dev_id, artist, title, url, "\n".join(tags)))
-            conn.commit()
-        except Exception as e:
-            log_event("error", "DB_WRITE_FAIL", id=dev_id, error=str(e))
+            try:
+                c.execute("""
+                    INSERT OR IGNORE INTO downloads (deviationid, artist, title, url, tags)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (dev_id, artist, title, url, "\n".join(tags)))
+                conn.commit()
+                log("DEBUG", "DB_WRITE", id=dev_id)
+            except Exception as e:
+                log("ERROR", "DB_WRITE_FAIL", id=dev_id, error=str(e))
 
-        db_queue.task_done()
+            db_queue.task_done()
+    except Exception as e:
+        log("CRITICAL", "DB_WORKER_CRASH", error=str(e))
 
 def is_downloaded(dev_id):
     conn = sqlite3.connect(DB_PATH)
@@ -116,93 +147,47 @@ def is_downloaded(dev_id):
 
 def safe_move(src, dst):
     try:
-        os.replace(src, dst)  # fast path (same filesystem)
+        os.replace(src, dst)
     except OSError:
-        shutil.copy2(src, dst)  # cross-device fallback
+        shutil.copy2(src, dst)
         os.remove(src)
 
 # --------------------------
-# TAG WORKER
+# TAG WORKER (simplified)
 # --------------------------
 def tag_worker():
-    while True:
-        item = tag_queue.get()
-        if item is None:
-            break
+    try:
+        while True:
+            item = tag_queue.get()
+            if item is None:
+                break
 
-        dev_id, artist, title, url, img_path = item
-        tags = []
+            dev_id, artist, title, url, img_path = item
 
-        if ENABLE_AUTOTAGGER:
-            try:
-                with open(img_path, "rb") as f:
-                    res = requests.post(
-                        AUTOTAGGER_URL,
-                        files={"file": f},
-                        data={"format": "json"},
-                        timeout=60
-                    )
-
-                res.raise_for_status()
-
-                if not res.text.strip():
-                    raise Exception("Empty response from autotagger")
-
-                data = res.json()
-
-                if isinstance(data, list) and data:
-                    tags_dict = data[0].get("tags", {})
-                    tags = list(tags_dict.keys())
-
-                log_event("info", "TAGGED", id=dev_id, tags=len(tags))
-
-            except Exception as e:
-                log_event("error", "TAG_FAIL", id=dev_id, error=str(e))
-
-        # ✅ WRITE TXT FILE
-        try:
             txt_path = os.path.splitext(img_path)[0] + ".txt"
 
             with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"title:{title}\n")
-                f.write(f"url:{url}\n\n")
+                f.write(f"title:{title}\nurl:{url}\n")
 
-                if tags:
-                    f.write("# AI tags\n")
-                    f.write("\n".join(tags) + "\n")
+            final_dir = os.path.join(SAVE_DIR, artist)
+            os.makedirs(final_dir, exist_ok=True)
 
-            log_event("info", "TXT_WRITTEN", id=dev_id)
-
-        except Exception as e:
-            log_event("error", "TXT_FAIL", id=dev_id, error=str(e))
-            tag_queue.task_done()
-            continue
-
-        # ✅ MOVE TO FINAL DESTINATION (atomic stage completion)
-        try:
-            final_artist_dir = os.path.join(SAVE_DIR, artist)
-            os.makedirs(final_artist_dir, exist_ok=True)
-
-            final_img = os.path.join(final_artist_dir, os.path.basename(img_path))
+            final_img = os.path.join(final_dir, os.path.basename(img_path))
             final_txt = os.path.splitext(final_img)[0] + ".txt"
 
             safe_move(img_path, final_img)
             safe_move(txt_path, final_txt)
 
-            log_event("info", "MOVED_TO_FINAL", id=dev_id)
+            db_queue.put((dev_id, artist, title, url, []))
 
-        except Exception as e:
-            log_event("error", "MOVE_FAIL", id=dev_id, error=str(e))
+            log("INFO", "FINALIZED", id=dev_id)
+
             tag_queue.task_done()
-            continue
-
-        # ✅ send to DB AFTER successful move
-        db_queue.put((dev_id, artist, title, url, tags))
-
-        tag_queue.task_done()
+    except Exception as e:
+        log("CRITICAL", "TAG_WORKER_CRASH", error=str(e))
 
 # --------------------------
-# OAUTH
+# AUTH
 # --------------------------
 AUTH_CODE = None
 
@@ -216,7 +201,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
             AUTH_CODE = params["code"][0]
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Auth success. You can close this.")
+            self.wfile.write(b"Auth success.")
         else:
             self.send_response(400)
             self.end_headers()
@@ -232,11 +217,7 @@ def get_auth_code():
         f"&scope=browse%20user"
     )
 
-    print("\n=== OPEN THIS URL ===")
     print(auth_url)
-    print("====================\n")
-
-    logging.warning(f"AUTH URL: {auth_url}")
 
     server = HTTPServer(("0.0.0.0", 8080), CallbackHandler)
 
@@ -245,9 +226,6 @@ def get_auth_code():
 
     return AUTH_CODE
 
-# --------------------------
-# TOKEN
-# --------------------------
 def save_token(token):
     token["expires_at"] = time.time() + token["expires_in"]
     with open(TOKEN_FILE, "w") as f:
@@ -291,85 +269,93 @@ def get_access_token():
     return token["access_token"]
 
 # --------------------------
-# REQUEST
+# REQUEST (VERBOSE)
 # --------------------------
 def deviantart_get(url, token, params=None):
     headers = {"Authorization": f"Bearer {token}"}
 
     while True:
+        log("DEBUG", "API_REQUEST", url=url, params=params)
+
         r = requests.get(url, headers=headers, params=params)
+
+        log("DEBUG", "API_RESPONSE", status=r.status_code, url=r.url)
 
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", RATE_LIMIT_SLEEP))
-            log_event("warning", "RATE_LIMIT", wait=wait)
+            log("WARNING", "RATE_LIMIT", wait=wait)
             time.sleep(wait)
             continue
 
         if r.status_code == 401:
+            log("WARNING", "TOKEN_EXPIRED")
             token = get_access_token()
             headers["Authorization"] = f"Bearer {token}"
             continue
 
+        data = r.json()
+        dump_json("API_DATA", data)
+
         r.raise_for_status()
-        return r.json()
+        return data
 
 # --------------------------
-# HELPERS
-# --------------------------
-def is_blurred(url):
-    return any(x in url for x in ["/v1/fit/", "/preview/"])
-
-# --------------------------
-# DOWNLOAD
+# DOWNLOAD LOGIC
 # --------------------------
 def save_deviation(token, artist, dev):
     dev_id = dev["deviationid"]
     title = dev.get("title", "untitled")
-    url = dev.get("url")
+
+    log("DEBUG", "PROCESS_DEV", id=dev_id)
+    dump_json("DEV_FULL", dev)
 
     if is_downloaded(dev_id):
         return
 
     content = dev.get("content")
     download = dev.get("download")
+    is_mature = dev.get("is_mature", False)
+
+    log("DEBUG", "MEDIA_CHECK",
+        has_content=bool(content),
+        has_download=bool(download),
+        is_mature=is_mature
+    )
 
     img_url = None
 
-    # prefer content
-    if content and content.get("src"):
-        img_url = content["src"]
-
-    # upgrade to download if better
-    if download and download.get("src"):
-        if not img_url or download.get("filesize", 0) > content.get("filesize", 0):
+    if is_mature:
+        if download and download.get("src"):
             img_url = download["src"]
+        else:
+            log("WARNING", "SKIP_MATURE_NO_DOWNLOAD", id=dev_id)
+            return
+    else:
+        if download and download.get("src"):
+            img_url = download["src"]
+        elif content and content.get("src"):
+            img_url = content["src"]
 
     if not img_url:
-        log_event("warning", "SKIP_NO_MEDIA", id=dev_id)
+        log("WARNING", "SKIP_NO_MEDIA", id=dev_id)
         return
 
-    if is_blurred(img_url):
-        log_event("warning", "SKIP_BLUR", id=dev_id)
+    if "token=" in img_url:
+        log("WARNING", "SKIP_TOKENIZED", id=dev_id)
         return
 
-    temp_artist_dir = os.path.join(TEMP_DIR, artist)
-    os.makedirs(temp_artist_dir, exist_ok=True)
+    path = os.path.join(TEMP_DIR, artist)
+    os.makedirs(path, exist_ok=True)
 
-    img_path = os.path.join(temp_artist_dir, f"{dev_id}.jpg")
+    img_path = os.path.join(path, f"{dev_id}.jpg")
 
-    try:
-        res = requests.get(img_url, timeout=30)
-        res.raise_for_status()
+    res = requests.get(img_url)
+    with open(img_path, "wb") as f:
+        f.write(res.content)
 
-        with open(img_path, "wb") as f:
-            f.write(res.content)
+    tag_queue.put((dev_id, artist, title, dev.get("url"), img_path))
 
-        tag_queue.put((dev_id, artist, title, url, img_path))
-
-        log_event("info", "DOWNLOADED", id=dev_id, artist=artist)
-
-    except Exception as e:
-        log_event("error", "DOWNLOAD_FAIL", id=dev_id, error=str(e))
+    log("INFO", "DOWNLOADED", id=dev_id)
 
 # --------------------------
 # MAIN
@@ -377,81 +363,48 @@ def save_deviation(token, artist, dev):
 def main():
     token = get_access_token()
 
-    # workers
-    threading.Thread(target=db_worker, daemon=True).start()
+    threading.Thread(target=db_worker, daemon=True, name="DB").start()
 
-    for _ in range(3):
-        threading.Thread(target=tag_worker, daemon=True).start()
+    for i in range(3):
+        threading.Thread(target=tag_worker, daemon=True, name=f"TAG-{i}").start()
 
-    progress = load_progress()
+    data = deviantart_get(
+        f"https://www.deviantart.com/api/v1/oauth2/user/friends/{USERNAME}",
+        token
+    )
 
-    friends_url = f"https://www.deviantart.com/api/v1/oauth2/user/friends/{USERNAME}"
-    data = deviantart_get(friends_url, token)
     artists = [f['user']['username'] for f in data.get("results", [])]
 
     for artist in artists:
-        state = progress.get(artist, {"offset": 0, "done": False})
+        log("INFO", "ARTIST", name=artist)
 
-        if state["done"] and not FORCE_RECHECK:
-            continue
+        data = deviantart_get(
+            "https://www.deviantart.com/api/v1/oauth2/gallery/all",
+            token,
+            {
+                "username": artist,
+                "limit": 24,
+                "mature_content": "true",
+                "expand": "deviation.download,deviation.content,deviation.flags"
+            }
+        )
 
-        offset = state["offset"]
+        results = data.get("results", [])
 
-        while True:
-            data = deviantart_get(
-                "https://www.deviantart.com/api/v1/oauth2/gallery/all",
-                token,
-                {
-                    "username": artist,
-                    "offset": offset,
-                    "limit": 24,
-                    "mature_content": "true",
-                    "expand": "deviation.download"
-                }
-            )
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            futures = [exe.submit(safe_run, save_deviation, token, artist, d) for d in results]
+            for f in as_completed(futures):
+                f.result()
 
-            results = data.get("results", [])
-            if not results:
-                break
-
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-                futures = [exe.submit(save_deviation, token, artist, d) for d in results]
-                for f in as_completed(futures):
-                    f.result()
-
-            offset = data.get("next_offset", 0)
-            progress[artist] = {"offset": offset, "done": False}
-            save_progress(progress)
-
-            if not data.get("has_more"):
-                break
-
-        progress[artist] = {"offset": 0, "done": True}
-        save_progress(progress)
-
-    # shutdown
     tag_queue.join()
-    for _ in range(3):
-        tag_queue.put(None)
-
     db_queue.join()
-    db_queue.put(None)
-
-# --------------------------
-# PROGRESS
-# --------------------------
-def load_progress():
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_progress(progress):
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(progress, f, indent=2)
 
 # --------------------------
 # RUN
 # --------------------------
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log("CRITICAL", "MAIN_CRASH", error=str(e))
+        raise

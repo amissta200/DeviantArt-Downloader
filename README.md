@@ -20,3 +20,7 @@ And in your DeviantArt app settings:
 
 Add EXACTLY:
 http://localhost:8080/callback
+
+-- 
+need to re-add subscription, paid etc checks.
+need to ensure temporary files are requeued for tagging and transfer
