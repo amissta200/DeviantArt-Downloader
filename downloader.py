@@ -23,10 +23,15 @@ SAVE_DIR = os.getenv("SAVE_DIR", "./downloads")
 TEMP_DIR = os.getenv("TEMP_DIR", "./temporary")
 DB_PATH = os.getenv("DB_PATH", "./downloads/deviantart.db")
 
-SLEEP_TIME = float(os.getenv("SLEEP_TIME", 0.5))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 6))
 RATE_LIMIT_SLEEP = int(os.getenv("RATE_LIMIT_SLEEP", 30))
-FORCE_RECHECK = os.getenv("FORCE_RECHECK", "false").lower() == "true"
+
+MIN_FILE_SIZE = int(os.getenv("MIN_FILE_SIZE", 15000)
+)
+ONLY_FULL_QUALITY = os.getenv("ONLY_FULL_QUALITY", "false").lower() == "true"
+
+ENABLE_AUTOTAGGER = os.getenv("ENABLE_AUTOTAGGER", "false").lower() == "true"
+AUTOTAGGER_URL = os.getenv("AUTOTAGGER_URL", "")
 
 TOKEN_FILE = os.path.join(SAVE_DIR, "token.json")
 PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
@@ -37,48 +42,25 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --------------------------
-# LOGGING (COLOR + THREAD)
+# LOGGING
 # --------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
-
-COLORS = {
-    "DEBUG": "\033[90m",
-    "INFO": "\033[94m",
-    "WARNING": "\033[93m",
-    "ERROR": "\033[91m",
-    "CRITICAL": "\033[95m",
-    "END": "\033[0m",
-}
-
 def log(level, msg, **kwargs):
-    if level == "DEBUG" and LOG_LEVEL != "DEBUG":
-        return
-
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    ts = datetime.now().strftime("%H:%M:%S")
     thread = threading.current_thread().name
     context = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(f"[{ts}] [{level}] [{thread}] {msg} {context}", flush=True)
 
-    color = COLORS.get(level, "")
-    end = COLORS["END"]
-
-    print(f"{color}[{ts}] [{level}] [{thread}] {msg} {context}{end}", file=sys.stderr)
-
-def dump_json(label, data, max_len=2000):
+# --------------------------
+# SAFE JSON DUMP
+# --------------------------
+def dump_json(label, data, max_len=1500):
     try:
-        txt = json.dumps(data, indent=2)[:max_len]
+        txt = json.dumps(data, indent=2)
+        if len(txt) > max_len:
+            txt = txt[:max_len] + " ...TRUNCATED"
         log("DEBUG", label, dump=txt)
-    except Exception as e:
-        log("ERROR", "JSON_DUMP_FAIL", error=str(e))
-
-# --------------------------
-# SAFETY WRAPPER
-# --------------------------
-def safe_run(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:
-        log("CRITICAL", "THREAD_CRASH", fn=fn.__name__, error=str(e))
-        raise
+    except Exception:
+        log("DEBUG", label, keys=list(data.keys()) if isinstance(data, dict) else "n/a")
 
 # --------------------------
 # QUEUES
@@ -112,84 +94,131 @@ def init_db():
 init_db()
 
 def db_worker():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
 
-        while True:
-            item = db_queue.get()
-            if item is None:
-                break
+    while True:
+        item = db_queue.get()
+        if item is None:
+            break
 
+        try:
             dev_id, artist, title, url, tags = item
 
-            try:
-                c.execute("""
-                    INSERT OR IGNORE INTO downloads (deviationid, artist, title, url, tags)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (dev_id, artist, title, url, "\n".join(tags)))
-                conn.commit()
-                log("DEBUG", "DB_WRITE", id=dev_id)
-            except Exception as e:
-                log("ERROR", "DB_WRITE_FAIL", id=dev_id, error=str(e))
+            c.execute("""
+                INSERT OR IGNORE INTO downloads
+                (deviationid, artist, title, url, tags)
+                VALUES (?, ?, ?, ?, ?)
+            """, (dev_id, artist, title, url, "\n".join(tags)))
 
-            db_queue.task_done()
-    except Exception as e:
-        log("CRITICAL", "DB_WORKER_CRASH", error=str(e))
+            conn.commit()
+            log("DEBUG", "DB_WRITE", id=dev_id)
+
+        except Exception as e:
+            log("ERROR", "DB_FAIL", error=str(e))
+
+        db_queue.task_done()
 
 def is_downloaded(dev_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT 1 FROM downloads WHERE deviationid = ?", (dev_id,))
-    result = c.fetchone()
+    c.execute("SELECT 1 FROM downloads WHERE deviationid=?", (dev_id,))
+    r = c.fetchone()
     conn.close()
-    return result is not None
-
-def safe_move(src, dst):
-    try:
-        os.replace(src, dst)
-    except OSError:
-        shutil.copy2(src, dst)
-        os.remove(src)
+    return r is not None
 
 # --------------------------
-# TAG WORKER (simplified)
+# TAG WORKER
 # --------------------------
 def tag_worker():
-    try:
-        while True:
-            item = tag_queue.get()
-            if item is None:
-                break
+    while True:
+        item = tag_queue.get()
+        if item is None:
+            break
 
-            dev_id, artist, title, url, img_path = item
+        dev_id, artist, title, url, img_path = item
+        tags = []
 
-            txt_path = os.path.splitext(img_path)[0] + ".txt"
+        if ENABLE_AUTOTAGGER:
+            try:
+                with open(img_path, "rb") as f:
+                    res = requests.post(
+                        AUTOTAGGER_URL,
+                        files={"file": f},
+                        data={"format": "json"},
+                        timeout=60
+                    )
 
+                log("DEBUG", "TAGGER_STATUS", code=res.status_code)
+
+                # ❌ HTTP failure
+                if res.status_code != 200:
+                    log("ERROR", "TAG_HTTP_FAIL",
+                        code=res.status_code,
+                        body=res.text[:300])
+                    raise Exception("Bad HTTP status")
+
+                # ❌ Empty response
+                if not res.text or not res.text.strip():
+                    log("ERROR", "TAG_EMPTY_RESPONSE")
+                    raise Exception("Empty response")
+
+                # ❌ Try parse JSON safely
+                try:
+                    data = res.json()
+                except Exception:
+                    log("ERROR", "TAG_INVALID_JSON",
+                        preview=res.text[:300])
+                    raise
+
+                # ❌ Unexpected format
+                if not isinstance(data, list) or not data:
+                    log("ERROR", "TAG_BAD_FORMAT", data=data)
+                    raise Exception("Unexpected JSON format")
+
+                tags_dict = data[0].get("tags", {})
+                tags = list(tags_dict.keys())
+
+                log("INFO", "TAGGED", id=dev_id, count=len(tags))
+
+            except Exception as e:
+                log("ERROR", "TAG_FAIL", id=dev_id, error=str(e))
+        try:
+            txt_path = img_path.replace(".jpg", ".txt")
             with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"title:{title}\nurl:{url}\n")
+                f.write(f"title:{title}\nurl:{url}\n\n")
+                if tags:
+                    f.write("\n".join(tags))
+        except Exception as e:
+            log("ERROR", "TXT_FAIL", error=str(e))
 
+        try:
             final_dir = os.path.join(SAVE_DIR, artist)
             os.makedirs(final_dir, exist_ok=True)
 
             final_img = os.path.join(final_dir, os.path.basename(img_path))
-            final_txt = os.path.splitext(final_img)[0] + ".txt"
+            final_txt = final_img.replace(".jpg", ".txt")
 
-            safe_move(img_path, final_img)
-            safe_move(txt_path, final_txt)
+            shutil.move(img_path, final_img)
+            shutil.move(txt_path, final_txt)
 
-            db_queue.put((dev_id, artist, title, url, []))
-
+            db_queue.put((dev_id, artist, title, url, tags))
             log("INFO", "FINALIZED", id=dev_id)
 
-            tag_queue.task_done()
-    except Exception as e:
-        log("CRITICAL", "TAG_WORKER_CRASH", error=str(e))
+        except Exception as e:
+            log("ERROR", "MOVE_FAIL", error=str(e))
+
+        tag_queue.task_done()
 
 # --------------------------
-# AUTH
+# AUTH (BULLETPROOF)
 # --------------------------
 AUTH_CODE = None
+
+SCOPES = [
+    "browse user",   # preferred
+    "browse"         # fallback
+]
 
 class CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -197,27 +226,27 @@ class CallbackHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
-        if "code" in params:
-            AUTH_CODE = params["code"][0]
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Auth success.")
-        else:
-            self.send_response(400)
-            self.end_headers()
+        AUTH_CODE = params.get("code", [None])[0]
 
-def get_auth_code():
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Auth success. You can close this.")
+
+def get_auth_code(scope):
     global AUTH_CODE
+    AUTH_CODE = None
 
     auth_url = (
         "https://www.deviantart.com/oauth2/authorize"
         f"?response_type=code"
         f"&client_id={CLIENT_ID}"
         f"&redirect_uri={urllib.parse.quote(REDIRECT_URI, safe='')}"
-        f"&scope=browse%20user"
+        f"&scope={urllib.parse.quote(scope)}"
     )
 
+    print("\n=== AUTHORIZE ===")
     print(auth_url)
+    print("=================\n")
 
     server = HTTPServer(("0.0.0.0", 8080), CallbackHandler)
 
@@ -226,88 +255,191 @@ def get_auth_code():
 
     return AUTH_CODE
 
-def save_token(token):
-    token["expires_at"] = time.time() + token["expires_in"]
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token, f)
+# --------------------------
+# TOKEN HELPERS
+# --------------------------
+def safe_json(res):
+    try:
+        return res.json()
+    except Exception:
+        return {"error": "invalid_json", "raw": res.text[:500]}
 
-def load_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    return None
+def validate_token(token):
+    """Make a small API call to confirm token is actually usable"""
+    try:
+        r = requests.get(
+            "https://www.deviantart.com/api/v1/oauth2/user/whoami",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
 
-def request_token(data):
-    r = requests.post("https://www.deviantart.com/oauth2/token", data=data)
-    r.raise_for_status()
-    return r.json()
-
-def get_access_token():
-    token = load_token()
-
-    if not token:
-        code = get_auth_code()
-        token = request_token({
+# --------------------------
+# REQUEST TOKEN (robust)
+# --------------------------
+def request_token_with_code(code, scope):
+    res = requests.post(
+        "https://www.deviantart.com/oauth2/token",
+        data={
             "grant_type": "authorization_code",
+            "code": code,
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "code": code
-        })
-        save_token(token)
-        return token["access_token"]
+            "redirect_uri": REDIRECT_URI
+        }
+    )
 
-    if time.time() > token["expires_at"]:
-        token = request_token({
+    data = safe_json(res)
+    log("DEBUG", "TOKEN_RESPONSE", data=data)
+
+    if "access_token" not in data:
+        raise Exception(f"Token exchange failed ({scope}): {data}")
+
+    return data
+
+def refresh_token(old_token):
+    res = requests.post(
+        "https://www.deviantart.com/oauth2/token",
+        data={
             "grant_type": "refresh_token",
-            "refresh_token": token["refresh_token"],
+            "refresh_token": old_token.get("refresh_token"),
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET
-        })
-        save_token(token)
+        }
+    )
+
+    data = safe_json(res)
+    log("DEBUG", "REFRESH_RESPONSE", data=data)
+
+    if "access_token" not in data:
+        raise Exception(f"Refresh failed: {data}")
+
+    return data
+
+# --------------------------
+# MAIN TOKEN ENTRY
+# --------------------------
+def get_token():
+    token = None
+
+    # --------------------------
+    # LOAD TOKEN
+    # --------------------------
+    if os.path.exists(TOKEN_FILE):
+        try:
+            token = json.load(open(TOKEN_FILE))
+            log("INFO", "TOKEN_LOADED")
+        except Exception:
+            log("WARNING", "TOKEN_CORRUPT")
+            token = None
+
+    # --------------------------
+    # VALID TOKEN?
+    # --------------------------
+    if token:
+        if time.time() < token.get("expires_at", 0):
+            if validate_token(token["access_token"]):
+                log("INFO", "TOKEN_VALID")
+                return token["access_token"]
+            else:
+                log("WARNING", "TOKEN_INVALID")
+
+        # try refresh
+        try:
+            log("INFO", "REFRESHING_TOKEN")
+            token = refresh_token(token)
+        except Exception as e:
+            log("WARNING", "REFRESH_FAILED", error=str(e))
+            token = None
+
+    # --------------------------
+    # FULL AUTH FLOW (WITH FALLBACK SCOPES)
+    # --------------------------
+    if not token:
+        for scope in SCOPES:
+            try:
+                log("INFO", "TRY_SCOPE", scope=scope)
+
+                code = get_auth_code(scope)
+                token = request_token_with_code(code, scope)
+
+                if validate_token(token["access_token"]):
+                    log("INFO", "TOKEN_VALIDATED", scope=scope)
+                    break
+                else:
+                    raise Exception("Token failed validation")
+
+            except Exception as e:
+                log("ERROR", "AUTH_ATTEMPT_FAILED", scope=scope, error=str(e))
+                token = None
+
+        if not token:
+            raise Exception("All auth attempts failed")
+
+    # --------------------------
+    # FINALIZE TOKEN
+    # --------------------------
+    expires_in = token.get("expires_in", 3600)
+    token["expires_at"] = time.time() + expires_in
+
+    try:
+        json.dump(token, open(TOKEN_FILE, "w"))
+        log("INFO", "TOKEN_SAVED", expires_in=expires_in)
+    except Exception as e:
+        log("WARNING", "TOKEN_SAVE_FAIL", error=str(e))
 
     return token["access_token"]
 
 # --------------------------
-# REQUEST (VERBOSE)
+# REQUEST
 # --------------------------
-def deviantart_get(url, token, params=None):
-    headers = {"Authorization": f"Bearer {token}"}
-
+def api_get(url, token, params=None):
     while True:
-        log("DEBUG", "API_REQUEST", url=url, params=params)
-
-        r = requests.get(url, headers=headers, params=params)
-
-        log("DEBUG", "API_RESPONSE", status=r.status_code, url=r.url)
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
 
         if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", RATE_LIMIT_SLEEP))
-            log("WARNING", "RATE_LIMIT", wait=wait)
-            time.sleep(wait)
+            log("WARN", "RATE_LIMIT")
+            time.sleep(RATE_LIMIT_SLEEP)
             continue
 
         if r.status_code == 401:
-            log("WARNING", "TOKEN_EXPIRED")
-            token = get_access_token()
-            headers["Authorization"] = f"Bearer {token}"
+            log("WARN", "TOKEN_REFRESH")
+            token = get_token()
             continue
 
-        data = r.json()
-        dump_json("API_DATA", data)
-
         r.raise_for_status()
-        return data
+        return r.json()
 
 # --------------------------
-# DOWNLOAD LOGIC
+# DOWNLOAD
 # --------------------------
-def save_deviation(token, artist, dev):
+def download_file(url, path):
+    for i in range(3):
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+
+            if len(r.content) < MIN_FILE_SIZE:
+                log("WARN", "TOO_SMALL", size=len(r.content))
+                return False
+
+            with open(path, "wb") as f:
+                f.write(r.content)
+
+            return True
+        except Exception as e:
+            log("ERROR", "RETRY", attempt=i, error=str(e))
+            time.sleep(2)
+
+    return False
+
+# --------------------------
+# CORE
+# --------------------------
+def process_dev(token, artist, dev):
     dev_id = dev["deviationid"]
-    title = dev.get("title", "untitled")
-
-    log("DEBUG", "PROCESS_DEV", id=dev_id)
-    dump_json("DEV_FULL", dev)
 
     if is_downloaded(dev_id):
         return
@@ -316,88 +448,102 @@ def save_deviation(token, artist, dev):
     download = dev.get("download")
     is_mature = dev.get("is_mature", False)
 
-    log("DEBUG", "MEDIA_CHECK",
-        has_content=bool(content),
-        has_download=bool(download),
-        is_mature=is_mature
-    )
-
     img_url = None
+    source = None
 
-    if is_mature:
-        if download and download.get("src"):
-            img_url = download["src"]
-        else:
-            log("WARNING", "SKIP_MATURE_NO_DOWNLOAD", id=dev_id)
-            return
+    if download and download.get("src"):
+        img_url = download["src"]
+        source = "download"
+    elif content and content.get("src") and not is_mature:
+        img_url = content["src"]
+        source = "content"
     else:
-        if download and download.get("src"):
-            img_url = download["src"]
-        elif content and content.get("src"):
-            img_url = content["src"]
-
-    if not img_url:
-        log("WARNING", "SKIP_NO_MEDIA", id=dev_id)
         return
 
-    if "token=" in img_url:
-        log("WARNING", "SKIP_TOKENIZED", id=dev_id)
+    if any(x in img_url for x in ["/v1/fit/", "/preview/"]):
         return
 
-    path = os.path.join(TEMP_DIR, artist)
-    os.makedirs(path, exist_ok=True)
+    if ONLY_FULL_QUALITY and source != "download":
+        return
 
-    img_path = os.path.join(path, f"{dev_id}.jpg")
+    temp_dir = os.path.join(TEMP_DIR, artist)
+    os.makedirs(temp_dir, exist_ok=True)
 
-    res = requests.get(img_url)
-    with open(img_path, "wb") as f:
-        f.write(res.content)
+    img_path = os.path.join(temp_dir, f"{dev_id}.jpg")
 
-    tag_queue.put((dev_id, artist, title, dev.get("url"), img_path))
+    if not download_file(img_url, img_path):
+        return
 
-    log("INFO", "DOWNLOADED", id=dev_id)
+    tag_queue.put((dev_id, artist, dev.get("title"), dev.get("url"), img_path))
+
+    log("INFO", "DOWNLOADED", id=dev_id, src=source)
 
 # --------------------------
 # MAIN
 # --------------------------
 def main():
-    token = get_access_token()
+    token = get_token()
 
     threading.Thread(target=db_worker, daemon=True, name="DB").start()
-
     for i in range(3):
         threading.Thread(target=tag_worker, daemon=True, name=f"TAG-{i}").start()
 
-    data = deviantart_get(
+    progress = load_progress()
+
+    friends = api_get(
         f"https://www.deviantart.com/api/v1/oauth2/user/friends/{USERNAME}",
         token
-    )
+    )["results"]
 
-    artists = [f['user']['username'] for f in data.get("results", [])]
+    for f in friends:
+        artist = f["user"]["username"]
+        offset = progress.get(artist, 0)
 
-    for artist in artists:
-        log("INFO", "ARTIST", name=artist)
+        while True:
+            data = api_get(
+                "https://www.deviantart.com/api/v1/oauth2/gallery/all",
+                token,
+                {
+                    "username": artist,
+                    "offset": offset,
+                    "limit": 24,
+                    "mature_content": "true",
+                    "expand": "deviation.download,deviation.content"
+                }
+            )
 
-        data = deviantart_get(
-            "https://www.deviantart.com/api/v1/oauth2/gallery/all",
-            token,
-            {
-                "username": artist,
-                "limit": 24,
-                "mature_content": "true",
-                "expand": "deviation.download,deviation.content,deviation.flags"
-            }
-        )
+            results = data.get("results", [])
+            if not results:
+                break
 
-        results = data.get("results", [])
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+                futures = [exe.submit(process_dev, token, artist, d) for d in results]
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        log("CRIT", "THREAD_FAIL", error=str(e))
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-            futures = [exe.submit(safe_run, save_deviation, token, artist, d) for d in results]
-            for f in as_completed(futures):
-                f.result()
+            offset = data.get("next_offset", 0)
+            progress[artist] = offset
+            save_progress(progress)
+
+            if not data.get("has_more"):
+                break
 
     tag_queue.join()
     db_queue.join()
+
+# --------------------------
+# PROGRESS
+# --------------------------
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        return json.load(open(PROGRESS_FILE))
+    return {}
+
+def save_progress(p):
+    json.dump(p, open(PROGRESS_FILE, "w"), indent=2)
 
 # --------------------------
 # RUN
