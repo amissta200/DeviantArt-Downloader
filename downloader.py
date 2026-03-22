@@ -127,6 +127,16 @@ def is_downloaded(dev_id):
     conn.close()
     return r is not None
 
+def fetch_metadata(token, deviation_id):
+    url = "https://www.deviantart.com/api/v1/oauth2/deviation/metadata"
+
+    params = {
+        "deviationids[]": deviation_id,
+        "mature_content": "true"
+    }
+
+    return api_get(url, token, params)
+
 # --------------------------
 # TAG WORKER
 # --------------------------
@@ -136,7 +146,7 @@ def tag_worker():
         if item is None:
             break
 
-        dev_id, artist, title, url, img_path = item
+        dev_id, artist, title, url, img_path, dev = item
         tags = []
 
         if ENABLE_AUTOTAGGER:
@@ -184,11 +194,44 @@ def tag_worker():
             except Exception as e:
                 log("ERROR", "TAG_FAIL", id=dev_id, error=str(e))
         try:
-            txt_path = img_path.replace(".jpg", ".txt")
+            # --------------------------
+            # EXTRACT DEVIANTART TAGS
+            # --------------------------
+            da_tags = []
+
+            try:
+                meta = fetch_metadata(get_token(), dev_id)
+
+                results = meta.get("metadata", [])
+                if results:
+                    tags_data = results[0].get("tags", [])
+
+                    da_tags = [
+                        t.get("tag_name")
+                        for t in tags_data
+                        if t.get("tag_name")
+                    ]
+
+            except Exception as e:
+                log("ERROR", "META_FETCH_FAIL", id=dev_id, error=str(e))
+
+            # --------------------------
+            # WRITE TXT
+            # --------------------------
+            txt_path = os.path.splitext(img_path)[0] + ".txt"
+
             with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(f"title:{title}\nurl:{url}\n\n")
+                f.write(f"title:{title}\n")
+                f.write(f"artist:{artist}\n")
+                f.write(f"url:{url}\n\n")
+
+                if da_tags:
+                    f.write("# deviantart tags\n")
+                    f.write("\n".join(da_tags) + "\n\n")
+
                 if tags:
-                    f.write("\n".join(tags))
+                    f.write("# AI tags\n")
+                    f.write("\n".join(tags) + "\n")
         except Exception as e:
             log("ERROR", "TXT_FAIL", error=str(e))
 
@@ -474,7 +517,7 @@ def process_dev(token, artist, dev):
     if not download_file(img_url, img_path):
         return
 
-    tag_queue.put((dev_id, artist, dev.get("title"), dev.get("url"), img_path))
+    tag_queue.put((dev_id, artist, dev.get("title"), dev.get("url"), img_path, dev))
 
     log("INFO", "DOWNLOADED", id=dev_id, src=source)
 
