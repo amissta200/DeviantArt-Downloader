@@ -2,3 +2,5 @@ downloads/
 .env
 tagged/
 test/
+downloads/
+downloads.old/

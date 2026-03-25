@@ -292,10 +292,39 @@ def save_deviation(token, artist, deviation):
 
     # Save image
     try:
-        img = requests.get(content["src"])
+        is_mature = deviation.get("is_mature", False)
+
+        if is_mature:
+            logging.debug(f"🔞 Mature content — resolving download URL for {deviation_id}")
+
+            download_api = f"https://www.deviantart.com/api/v1/oauth2/deviation/download/{deviation_id}"
+            params = {"access_token": token}
+
+            download_data = deviantart_get(download_api, token, params)
+
+            # If API failed or limit hit
+            if not download_data or "src" not in download_data:
+                error_msg = download_data.get("error_description", "Unknown error")
+                logging.warning(f"⚠️ Download API failed for {deviation_id}: {error_msg}")
+                return
+
+            real_url = download_data["src"]
+            img = requests.get(real_url, timeout=20)
+
+        else:
+            logging.debug(f"🖼️ Normal content — using content[src] for {deviation_id}")
+
+            if "src" not in content:
+                logging.warning(f"⚠️ No content[src] for {deviation_id}")
+                return
+
+            img = requests.get(content["src"], timeout=20)
+
         img.raise_for_status()
+
         with open(img_path, "wb") as f:
             f.write(img.content)
+
     except Exception as e:
         logging.warning(f"⚠️ Failed to download image {title}: {e}")
 
