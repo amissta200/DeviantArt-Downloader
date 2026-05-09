@@ -5,6 +5,12 @@ import sqlite3
 import json
 import requests
 import pprint
+import webbrowser
+import hashlib
+import secrets
+import base64
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, urlencode
 from requests.exceptions import HTTPError, RequestException
 
 # --------------------------
@@ -23,7 +29,11 @@ FORCE_RECHECK = os.getenv("FORCE_RECHECK", "false").lower() == "true"
 PROGRESS_FILE = os.path.join(SAVE_DIR, "progress.json")
 DOWNLOAD_SUBSCRIPTIONS = os.getenv("DOWNLOAD_SUBSCRIPTIONS", "false").lower() == "true"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+TOKEN_FILE = os.path.join(SAVE_DIR, "tokens.json")
 
+# OAuth redirect — must match what you registered in your DeviantArt app settings
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/callback")
+OAUTH_SCOPE = "basic browse"
 
 if not all([CLIENT_ID, CLIENT_SECRET, USERNAME]):
     raise ValueError("Missing CLIENT_ID, CLIENT_SECRET, or USERNAME in environment variables.")
@@ -52,9 +62,8 @@ def add_is_premium_column_if_missing(conn):
         conn.commit()
         logging.info("✅ Added 'is_premium' column to downloads table.")
     except sqlite3.OperationalError as e:
-        # This error usually means the column already exists, so safe to ignore
         if "duplicate column name" in str(e):
-            logging.info("'is_premium' column already exists, skipping ALTER TABLE.")
+            logging.debug("'is_premium' column already exists, skipping ALTER TABLE.")
         else:
             logging.error(f"❌ Unexpected error altering table: {e}")
             raise
@@ -87,7 +96,7 @@ def is_downloaded(deviation_id):
 def mark_subscription(deviation_id, artist, title, url):
     c = conn.cursor()
     c.execute("""
-        INSERT OR IGNORE INTO downloads 
+        INSERT OR IGNORE INTO downloads
         (deviationid, artist, title, url, tags, is_premium)
         VALUES (?, ?, ?, ?, ?, 1)
     """, (deviation_id, artist, title, url, ""))
@@ -111,25 +120,149 @@ def mark_downloaded(deviation_id, artist, title, url, tags):
     conn.commit()
 
 # --------------------------
-# Authentication
+# Token persistence
 # --------------------------
-def get_access_token():
-    url = "https://www.deviantart.com/oauth2/token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET
-    }
-    r = requests.post(url, data=data)
-    r.raise_for_status()
-    token = r.json().get("access_token")
-    logging.info("✅ Authenticated successfully.")
-    return token
+def save_tokens(access_token, refresh_token):
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump({"access_token": access_token, "refresh_token": refresh_token}, f)
+        logging.debug("💾 Tokens saved.")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not save tokens: {e}")
+
+def load_tokens():
+    if not os.path.exists(TOKEN_FILE):
+        return None, None
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("access_token"), data.get("refresh_token")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not load tokens: {e}")
+        return None, None
 
 # --------------------------
-# Rate-limited GET with refresh
+# OAuth2 Authorization Code Flow
 # --------------------------
+
+def generate_pkce():
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return code_verifier, code_challenge
+
+# Store verifier globally so exchange function can access it
+_code_verifier = None
+
+# Simple one-shot HTTP server to capture the OAuth callback
+_auth_code = None
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global _auth_code
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        _auth_code = params.get("code", [None])[0]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"<h1>Authorization complete. You can close this tab.</h1>")
+        logging.info("✅ Authorization code received.")
+
+    def log_message(self, format, *args):
+        pass  # suppress default HTTP server logs
+
+
+def get_auth_code():
+    global _code_verifier
+    _code_verifier, code_challenge = generate_pkce()
+
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": OAUTH_SCOPE,
+        "state": "deviantart_downloader",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = "https://www.deviantart.com/oauth2/authorize?" + urlencode(params)
+    logging.info(f"🌐 Opening browser for authorization:\n{auth_url}")
+    webbrowser.open(auth_url)
+
+    parsed = urlparse(REDIRECT_URI)
+    port = parsed.port or 8080
+    server = HTTPServer(("0.0.0.0", port), _CallbackHandler)
+    server.handle_request()
+    return _auth_code
+
+
+def exchange_code_for_tokens(code):
+    r = requests.post("https://www.deviantart.com/oauth2/token", data={
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "code": code,
+        "code_verifier": _code_verifier,   # ← PKCE verifier
+    })
+    r.raise_for_status()
+    data = r.json()
+    access_token = data["access_token"]
+    refresh_token = data["refresh_token"]
+    save_tokens(access_token, refresh_token)
+    logging.info("✅ Tokens obtained via authorization code.")
+    return access_token, refresh_token
+
+
+def refresh_access_token(refresh_token):
+    """Use the refresh token to get a new access token."""
+    r = requests.post("https://www.deviantart.com/oauth2/token", data={
+        "grant_type": "refresh_token",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": refresh_token,
+    })
+    r.raise_for_status()
+    data = r.json()
+    new_access = data["access_token"]
+    new_refresh = data.get("refresh_token", refresh_token)  # DA may or may not rotate it
+    save_tokens(new_access, new_refresh)
+    logging.info("🔄 Access token refreshed successfully.")
+    return new_access, new_refresh
+
+
+def authenticate():
+    """
+    Full auth flow:
+    1. Try saved tokens → attempt a refresh.
+    2. If no saved tokens, do the browser-based authorization code flow.
+    Returns (access_token, refresh_token).
+    """
+    access_token, refresh_token = load_tokens()
+
+    if refresh_token:
+        logging.info("🔑 Found saved refresh token — refreshing access token...")
+        try:
+            access_token, refresh_token = refresh_access_token(refresh_token)
+            return access_token, refresh_token
+        except Exception as e:
+            logging.warning(f"⚠️ Refresh failed ({e}), re-authorizing via browser...")
+
+    # No valid tokens — do the full browser flow
+    code = get_auth_code()
+    if not code:
+        raise RuntimeError("❌ Failed to obtain authorization code from DeviantArt.")
+    return exchange_code_for_tokens(code)
+
+
+# --------------------------
+# Rate-limited GET with auto token refresh
+# --------------------------
+_refresh_token_global = None  # module-level so deviantart_get can refresh inline
+
 def deviantart_get(url, token, params=None):
+    global _refresh_token_global
     retries = 0
     while retries < MAX_RETRIES:
         headers = {"Authorization": f"Bearer {token}"}
@@ -145,9 +278,16 @@ def deviantart_get(url, token, params=None):
 
             if r.status_code == 401:
                 logging.warning("🔄 Token expired — refreshing...")
-                token = get_access_token()   # refresh
-                retries += 1
-                continue                     # retry with new token
+                if _refresh_token_global:
+                    try:
+                        token, _refresh_token_global = refresh_access_token(_refresh_token_global)
+                        retries += 1
+                        continue
+                    except Exception as e:
+                        logging.error(f"❌ Could not refresh token: {e}")
+                        raise RuntimeError("Token refresh failed, re-run the script to re-authorize.")
+                else:
+                    raise RuntimeError("No refresh token available — re-run the script to re-authorize.")
 
             if not r.ok:
                 logging.error(f"❌ Request failed {r.status_code}: {r.text[:200]}")
@@ -158,7 +298,7 @@ def deviantart_get(url, token, params=None):
             return r.json()
 
         except (HTTPError, RequestException) as e:
-            logging.error(f"Request exception {e}")
+            logging.error(f"Request exception: {e}")
             retries += 1
             time.sleep(SLEEP_TIME)
 
@@ -196,7 +336,7 @@ def get_followed_artists(token):
 
     logging.info(f"📜 Fetching followed artists for {USERNAME}...")
     while True:
-        params = {"access_token": token, "offset": offset, "limit": 24}
+        params = {"offset": offset, "limit": 24, "mature_content": "true"}
         data = deviantart_get(url, token, params)
         batch = [f['user']['username'] for f in data.get('results', [])]
         artists.extend(batch)
@@ -225,22 +365,15 @@ def save_deviation(token, artist, deviation):
     if is_downloaded(deviation_id):
         logging.debug(f"⏩ Skipping already downloaded {deviation_id}")
         return
-        
+
     def is_subscription_content(deviation: dict) -> bool:
-        # ---- Legacy DA premium system ----
         premium_data = deviation.get("premium_folder_data")
         if premium_data is not None and premium_data.get("type") == "paid":
             return True
-
-        # ---- Modern DA access control ----
-        # Field only exists when gating is active
         if "tier_access" in deviation:
             return True
-
-        # ---- Tier system presence ----
         if "primary_tier" in deviation:
             return True
-
         return False
 
     is_premium = is_subscription_content(deviation)
@@ -249,21 +382,14 @@ def save_deviation(token, artist, deviation):
         logging.info(f"💰 Detected subscription content: {title} ({deviation_id})")
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(pprint.pformat(deviation))
-
-        # Always flag in DB
         mark_subscription(deviation_id, artist, title, url)
-
-        # Only download if explicitly enabled
         if not DOWNLOAD_SUBSCRIPTIONS:
             return
-
         logging.warning(f"⚠️ DOWNLOAD_SUBSCRIPTIONS enabled — attempting download anyway")
-
 
     # Fetch metadata for tags
     meta_url = "https://www.deviantart.com/api/v1/oauth2/deviation/metadata"
     params = {
-        "access_token": token,
         "deviationids[]": deviation_id,
         "mature_content": "true"
     }
@@ -298,13 +424,12 @@ def save_deviation(token, artist, deviation):
             logging.debug(f"🔞 Mature content — resolving download URL for {deviation_id}")
 
             download_api = f"https://www.deviantart.com/api/v1/oauth2/deviation/download/{deviation_id}"
-            params = {"access_token": token}
+            params = {"mature_content": "true"}
 
             download_data = deviantart_get(download_api, token, params)
 
-            # If API failed or limit hit
             if not download_data or "src" not in download_data:
-                error_msg = download_data.get("error_description", "Unknown error")
+                error_msg = download_data.get("error_description", "Unknown error") if download_data else "No response"
                 logging.warning(f"⚠️ Download API failed for {deviation_id}: {error_msg}")
                 return
 
@@ -314,7 +439,7 @@ def save_deviation(token, artist, deviation):
         else:
             logging.debug(f"🖼️ Normal content — using content[src] for {deviation_id}")
 
-            if "src" not in content:
+            if not content or "src" not in content:
                 logging.warning(f"⚠️ No content[src] for {deviation_id}")
                 return
 
@@ -328,6 +453,7 @@ def save_deviation(token, artist, deviation):
     except Exception as e:
         logging.warning(f"⚠️ Failed to download image {title}: {e}")
 
+    # Auto-tagger
     try:
         with open(img_path, "rb") as img_file:
             response = requests.post(
@@ -340,12 +466,10 @@ def save_deviation(token, artist, deviation):
         response.raise_for_status()
         tagger_output = response.json()
 
-        # Extract tag names (ignore confidence values)
         ai_tags = []
         if isinstance(tagger_output, list) and tagger_output:
             ai_tags = list(tagger_output[0].get("tags", {}).keys())
 
-        # Append tags to existing txt
         if ai_tags:
             with open(txt_path, "a", encoding="utf-8") as f:
                 f.write("\n# AI tags\n")
@@ -362,7 +486,10 @@ def save_deviation(token, artist, deviation):
 # Main
 # --------------------------
 def main():
-    token = get_access_token()
+    global _refresh_token_global
+
+    token, _refresh_token_global = authenticate()
+
     artists = get_followed_artists(token)
     logging.info(f"Found {len(artists)} artists")
 
@@ -374,14 +501,18 @@ def main():
         logging.info(f"🎨 Processing artist ({idx + 1}/{len(artists)}): {artist}")
 
         try:
-            # Use start_offset only for first artist after resuming
             offset_to_use = start_offset if idx == start_artist_idx else 0
             url = "https://www.deviantart.com/api/v1/oauth2/gallery/all"
             has_more = True
             current_offset = offset_to_use
 
             while has_more:
-                params = {"username": artist, "access_token": token, "offset": current_offset, "limit": 24}
+                params = {
+                    "username": artist,
+                    "offset": current_offset,
+                    "limit": 24,
+                    "mature_content": "true",   # ← key addition
+                }
                 data = deviantart_get(url, token, params)
                 results = data.get("results", [])
                 if not results:
@@ -394,17 +525,13 @@ def main():
 
                 has_more = data.get("has_more", False)
                 current_offset = data.get("next_offset", 0)
-
-                # Save progress after each page of deviations for this artist
                 save_progress(idx, current_offset)
 
-            # Reset offset for next artist
             start_offset = 0
 
         except Exception as e:
             logging.error(f"❌ Error with {artist}: {e}")
 
-    # Finished all artists, reset progress
     save_progress(0, 0)
 
 if __name__ == "__main__":

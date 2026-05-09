@@ -1,6 +1,7 @@
 services:
   deviantart_downloader:
     container_name: deviantart_downloader
+    restart: unless-stopped
     build: .
     env_file: .env
     environment:
@@ -13,13 +14,29 @@ services:
       - SLEEP_TIME=2.5
       - MAX_RETRIES=10
       - RATE_LIMIT_SLEEP=120
-      - FORCE_RECHECK=false   # Set to true to force re-check from start
+      - FORCE_RECHECK=false
       - DOWNLOAD_SUBSCRIPTIONS=false
       - DEBUG_MODE=false
+    ports:
+      - "8080:8080"
     volumes:
       - ./downloads:/downloads
+    depends_on:
+      - autotagger-deviantart
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://autotagger-deviantart:5000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
   autotagger-deviantart:
       container_name: autotagger-deviantart
+      restart: unless-stopped
       image: ghcr.io/danbooru/autotagger
-      depends_on:
-        - deviantart_downloader
+      # deploy:
+      #   resources:
+      #     reservations:
+      #       devices:
+      #         - driver: nvidia
+      #           count: all
+      #           capabilities: [gpu]
